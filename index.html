@@ -179,11 +179,6 @@
     font-size: 14px; padding: 6px 14px; letter-spacing: .04em;
     background: rgba(120,150,255,.30); color: #cdd6ff;
     border: 1px solid rgba(157,176,255,.55);
-    animation: burstPulse 1.5s ease-in-out infinite;
-  }
-  @keyframes burstPulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(157,176,255,0); }
-    50%      { box-shadow: 0 0 16px 1px rgba(157,176,255,.65); }
   }
   .status-tag { margin-left: auto; font-weight: 800; font-size: 14.5px; }
   .status-tag.keep { color: var(--keep); }
@@ -343,7 +338,7 @@
         <div class="flash" id="flash"><span></span></div>
         <div class="canvas-tools" id="canvasTools" style="display:none">
           <button class="ctool" id="btnFullRes" title="Charger la photo en pleine résolution (F)">⤢ Pleine résolution</button>
-          <button class="ctool" id="btnLoupe" title="Loupe — survolez la photo (L)">🔍 Loupe</button>
+          <button class="ctool" id="btnLoupe" title="Loupe — survolez la photo · molette = zoom (L)">🔍 Loupe</button>
         </div>
         <div class="loupe" id="loupe"></div>
       </div>
@@ -764,19 +759,34 @@ els.btnFullRes.onclick = loadFullRes;
 // whatever version is currently displayed — so once the full resolution is
 // loaded, the loupe reveals real detail; otherwise it enlarges the preview.
 const LOUPE_D = 240;     // diameter in px (matches CSS)
-const LOUPE_ZOOM = 2.5;  // magnification relative to on-screen size
+const LOUPE_ZOOM_MIN = 1.5, LOUPE_ZOOM_MAX = 8, LOUPE_ZOOM_STEP = 0.5;
+let loupeZoom = 2.5;     // magnification relative to on-screen size (molette = ajuste)
 let loupeOn = false;
+
+function setLoupeLabel() {
+  els.btnLoupe.textContent = loupeOn ? `🔍 Loupe ×${loupeZoom.toFixed(1)}` : "🔍 Loupe";
+}
 
 function toggleLoupe() {
   loupeOn = !loupeOn;
   els.btnLoupe.classList.toggle("active", loupeOn);
   els.canvas.classList.toggle("loupe-on", loupeOn);
+  setLoupeLabel();
   if (!loupeOn) els.loupe.style.display = "none";
 }
 
 els.btnLoupe.onclick = toggleLoupe;
 els.canvas.addEventListener("mousemove", onLoupeMove);
 els.canvas.addEventListener("mouseleave", () => { els.loupe.style.display = "none"; });
+// Mouse wheel adjusts the magnification while the loupe is active.
+els.canvas.addEventListener("wheel", (e) => {
+  if (!loupeOn) return;
+  e.preventDefault();
+  const dir = e.deltaY < 0 ? 1 : -1;
+  loupeZoom = Math.min(LOUPE_ZOOM_MAX, Math.max(LOUPE_ZOOM_MIN, loupeZoom + dir * LOUPE_ZOOM_STEP));
+  setLoupeLabel();
+  onLoupeMove(e); // re-render the lens at the same spot with the new zoom
+}, { passive: false });
 
 function onLoupeMove(e) {
   if (!loupeOn) return;
@@ -801,7 +811,7 @@ function onLoupeMove(e) {
   if (rx < 0 || rx > 1 || ry < 0 || ry > 1) { els.loupe.style.display = "none"; return; }
 
   const src = img.currentSrc || img.src;
-  const bgW = rW * LOUPE_ZOOM, bgH = rH * LOUPE_ZOOM;
+  const bgW = rW * loupeZoom, bgH = rH * loupeZoom;
   const cr = els.canvas.getBoundingClientRect();
   els.loupe.style.backgroundImage = `url("${src}")`;
   els.loupe.style.backgroundSize = `${bgW}px ${bgH}px`;
@@ -957,7 +967,7 @@ els.btnExport.onclick = async () => {
   const kept = units.filter(u => u.status === "keep");
   if (!kept.length) { toast("Aucune photo gardée à exporter."); return; }
   let destHandle;
-  try { destHandle = await window.showDirectoryPicker({ id: "tri-export", mode: "readwrite" }); }
+  try { destHandle = await window.showDirectoryPicker({ mode: "readwrite", startIn: sourceHandle }); }
   catch { return; }
 
   els.btnExport.disabled = true;
