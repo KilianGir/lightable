@@ -280,6 +280,12 @@
     <!-- Solo viewer -->
     <div class="viewer" id="viewer">
       <div class="canvas" id="canvas">
+        <img id="mainImg" style="display:none" alt="">
+        <div class="raw-placeholder" id="rawPlaceholder" style="display:none">
+          <div class="badge">RAW</div>
+          <div class="rp-name"></div>
+          <div style="font-size:12px">Aperçu indisponible — fichier RAW sans JPEG</div>
+        </div>
         <div class="flash" id="flash"><span></span></div>
       </div>
       <div class="meta-strip" id="metaStrip"></div>
@@ -319,6 +325,8 @@ const els = {
   loaderText: document.getElementById("loaderText"),
   viewer: document.getElementById("viewer"),
   canvas: document.getElementById("canvas"),
+  mainImg: document.getElementById("mainImg"),
+  rawPlaceholder: document.getElementById("rawPlaceholder"),
   flash: document.getElementById("flash"),
   metaStrip: document.getElementById("metaStrip"),
   sidebar: document.getElementById("sidebar"),
@@ -358,8 +366,8 @@ document.getElementById("btnOpen").onclick = openFolder;
 document.getElementById("btnOpen2").onclick = openFolder;
 
 async function scanFolder() {
-  // revoke any previously created object URLs (full-size window + strip thumbs)
-  for (const u of units) { if (u.url) { URL.revokeObjectURL(u.url); u.url = null; } }
+  // revoke any previously created object URLs (full-size cache + strip thumbs)
+  for (const u of units) freeUnit(u);
   for (const url of stripThumbUrls.values()) URL.revokeObjectURL(url);
   stripThumbUrls.clear();
   const files = [];
@@ -473,33 +481,63 @@ els.slider.oninput = () => {
   }
 };
 
-// ---------- Image loading (current + next only) ----------
-async function ensureUrl(u) {
-  if (u.url) return u.url;
-  if (!u.jpg) return null; // raw only -> no preview
-  const file = await u.jpg.getFile();
-  u.url = URL.createObjectURL(file);
-  return u.url;
+// ---------- Image loading (decoded-image cache + preload window) ----------
+// Preload this many photos ahead / behind so advancing is instant.
+const AHEAD = 3;
+const BEHIND = 1;
+
+// Each unit gets a cache entry: { url, img, ready }
+//   url   : object URL for the JPEG blob
+//   img   : an <img> element whose pixels are already decoded
+//   ready : Promise that resolves once decode() completes
+// We keep the decoded <img> elements alive so swapping them into the
+// canvas is a pointer move, not a fresh file-read + JPEG decode.
+
+function loadUnit(u) {
+  if (!u.jpg) return null;          // raw-only: no preview
+  if (u.cache) return u.cache;      // already loading or loaded
+  const entry = { url: null, img: null, ready: null };
+  entry.ready = (async () => {
+    const file = await u.jpg.getFile();
+    entry.url = URL.createObjectURL(file);
+    const img = new Image();
+    img.src = entry.url;
+    img.alt = u.name;
+    // decode() forces the JPEG to be turned into pixels off-screen.
+    // This is the step that otherwise stalls the UI on big files.
+    try { await img.decode(); } catch { /* decode may reject if revoked */ }
+    entry.img = img;
+    return entry;
+  })();
+  u.cache = entry;
+  return entry;
 }
 
-function freeUrl(u) {
-  if (u.url) { URL.revokeObjectURL(u.url); u.url = null; }
+function freeUnit(u) {
+  if (!u.cache) return;
+  if (u.cache.url) URL.revokeObjectURL(u.cache.url);
+  u.cache = null;
 }
 
-// Keep only the current photo and the immediately next one decoded.
-// The next one is prefetched in the background so it appears instantly
-// when you advance, but nothing further ahead is touched.
-async function syncWindow() {
-  const keep = new Set([cursor]);
-  if (cursor + 1 < units.length) keep.add(cursor + 1);
-  for (let i = 0; i < units.length; i++) {
-    if (!keep.has(i)) freeUrl(units[i]);
+// Free everything outside the window, then preload everything inside it.
+function syncWindow() {
+  const keep = new Set();
+  for (let d = -BEHIND; d <= AHEAD; d++) {
+    const i = cursor + d;
+    if (i >= 0 && i < units.length) keep.add(i);
   }
-  await ensureUrl(units[cursor]);              // current first, awaited
-  if (cursor + 1 < units.length) ensureUrl(units[cursor + 1]); // next, background
+  for (let i = 0; i < units.length; i++) {
+    if (!keep.has(i)) freeUnit(units[i]);
+  }
+  // Kick off loads for the whole window. Current one first so it wins
+  // any bandwidth race; the rest decode in the background.
+  loadUnit(units[cursor]);
+  for (const i of keep) if (i !== cursor) loadUnit(units[i]);
 }
 
 // ---------- Render ----------
+let renderToken = 0; // guards against out-of-order async renders
+
 function render() {
   if (!units.length) return;
   syncWindow();
@@ -509,21 +547,9 @@ function render() {
 
 async function renderSolo(unitIdx) {
   const u = units[unitIdx];
-  const url = await ensureUrl(u);
+  const token = ++renderToken;
 
-  els.canvas.querySelectorAll("img, .raw-placeholder").forEach(n => n.remove());
-  if (url) {
-    const img = document.createElement("img");
-    img.src = url; img.alt = u.name;
-    els.canvas.insertBefore(img, els.flash);
-  } else {
-    const ph = document.createElement("div");
-    ph.className = "raw-placeholder";
-    ph.innerHTML = `<div class="badge">RAW</div><div>${u.name}</div><div style="font-size:12px">Aperçu indisponible — fichier RAW sans JPEG</div>`;
-    els.canvas.insertBefore(ph, els.flash);
-  }
-
-  // meta strip
+  // --- meta strip (synchronous, instant) ---
   let chips = "";
   if (u.jpg && u.raw) chips += `<span class="chip pair">RAW + JPEG</span>`;
   else if (u.isRawOnly) chips += `<span class="chip raw">RAW</span>`;
@@ -536,6 +562,34 @@ async function renderSolo(unitIdx) {
   els.metaStrip.innerHTML =
     `<span class="fname">${u.name}</span>${chips}<span>${dt}</span>` +
     `<span style="color:var(--ink-dim)">${cursor + 1} / ${units.length}</span>${st}`;
+
+  // --- image ---
+  const mainImg = els.mainImg;
+  const placeholder = els.rawPlaceholder;
+
+  if (!u.jpg) {
+    // RAW-only: show placeholder, hide the image
+    mainImg.style.display = "none";
+    placeholder.style.display = "flex";
+    placeholder.querySelector(".rp-name").textContent = u.name;
+    return;
+  }
+
+  const entry = loadUnit(u);
+  if (entry.img && entry.url) {
+    // already decoded — instant swap
+    placeholder.style.display = "none";
+    mainImg.src = entry.url;
+    mainImg.style.display = "block";
+  } else {
+    // not ready yet (far jump): keep current frame until decode finishes,
+    // then swap — but only if the user hasn't navigated away meanwhile.
+    await entry.ready;
+    if (token !== renderToken) return; // superseded by a newer navigation
+    placeholder.style.display = "none";
+    mainImg.src = entry.url;
+    mainImg.style.display = "block";
+  }
 }
 
 // ---------- Decisions ----------
@@ -550,7 +604,10 @@ function decideSoloAndAdvance(status) {
   units[cursor].status = status;
   showFlash(status);
   updateProgress(); updateStripStatus(cursor); saveSession();
-  setTimeout(() => { if (cursor < units.length - 1) { cursor++; render(); } else renderSolo(cursor); }, 180);
+  // Advance immediately — the next photo is already decoded, so the swap
+  // is instant; the flash plays over the new frame.
+  if (cursor < units.length - 1) { cursor++; render(); }
+  else renderSolo(cursor);
 }
 
 function showFlash(status) {
