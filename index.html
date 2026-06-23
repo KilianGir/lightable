@@ -110,6 +110,7 @@
   .canvas img {
     max-width: 100%; max-height: 100%; object-fit: contain;
     border-radius: 6px; box-shadow: var(--shadow);
+    image-orientation: from-image;
   }
   .raw-placeholder {
     display: flex; flex-direction: column; align-items: center; gap: 16px;
@@ -481,36 +482,80 @@ els.slider.oninput = () => {
   }
 };
 
-// ---------- Image loading (decoded-image cache + preload window) ----------
-// Preload this many photos ahead / behind so advancing is instant.
-const AHEAD = 3;
-const BEHIND = 1;
+// ---------- Image loading (EXIF thumbnail + downscale fallback) ----------
+// Full 26 Mpx JPEGs are far too heavy to decode per photo (~100 MB of
+// pixels each, hundreds of ms). For keep/reject triage we only need a
+// ~1600px preview, so we use the thumbnail the camera already embedded in
+// the JPEG (instant), and only fall back to downscaling the full file when
+// no usable embedded preview exists.
+const AHEAD = 4;
+const BEHIND = 2;
+const PREVIEW_MAX = 1600;     // longest edge we render for triage
+const MIN_EMBEDDED = 1000;    // embedded thumb must be at least this wide to trust it
 
-// Each unit gets a cache entry: { url, img, ready }
-//   url   : object URL for the JPEG blob
-//   img   : an <img> element whose pixels are already decoded
-//   ready : Promise that resolves once decode() completes
-// We keep the decoded <img> elements alive so swapping them into the
-// canvas is a pointer move, not a fresh file-read + JPEG decode.
+// cache entry per unit: { url, ready }
+//   url   : object URL of a lightweight preview (embedded thumb or downscaled)
+//   ready : Promise resolving once the preview URL is available
 
 function loadUnit(u) {
   if (!u.jpg) return null;          // raw-only: no preview
   if (u.cache) return u.cache;      // already loading or loaded
-  const entry = { url: null, img: null, ready: null };
+  const entry = { url: null, ready: null };
   entry.ready = (async () => {
-    const file = await u.jpg.getFile();
-    entry.url = URL.createObjectURL(file);
-    const img = new Image();
-    img.src = entry.url;
-    img.alt = u.name;
-    // decode() forces the JPEG to be turned into pixels off-screen.
-    // This is the step that otherwise stalls the UI on big files.
-    try { await img.decode(); } catch { /* decode may reject if revoked */ }
-    entry.img = img;
+    try {
+      const file = await u.jpg.getFile();
+      const blob = await makePreviewBlob(file);
+      entry.url = URL.createObjectURL(blob);
+    } catch (e) {
+      entry.url = null;
+    }
     return entry;
   })();
   u.cache = entry;
   return entry;
+}
+
+// Produce a small preview Blob from a full-size JPEG file.
+async function makePreviewBlob(file) {
+  // 1) Try the embedded EXIF thumbnail — near-instant, no full decode.
+  try {
+    const thumb = await exifr.thumbnail(file); // Uint8Array or undefined
+    if (thumb && thumb.byteLength) {
+      const tBlob = new Blob([thumb], { type: "image/jpeg" });
+      // Check it's big enough to judge sharpness; many cameras embed ~1600px.
+      const dims = await blobDimensions(tBlob);
+      if (dims && Math.max(dims.w, dims.h) >= MIN_EMBEDDED) return tBlob;
+    }
+  } catch {}
+
+  // 2) Fallback: downscale the full file once with hardware-accelerated decode.
+  //    createImageBitmap with resizeWidth avoids ever holding the full
+  //    26 Mpx bitmap in JS, and lets the browser decode at reduced size.
+  try {
+    const bmp = await createImageBitmap(file, {
+      resizeWidth: PREVIEW_MAX,
+      resizeQuality: "medium",
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = bmp.width; canvas.height = bmp.height;
+    canvas.getContext("2d").drawImage(bmp, 0, 0);
+    bmp.close && bmp.close();
+    const out = await new Promise(res => canvas.toBlob(res, "image/jpeg", 0.85));
+    return out || file;
+  } catch {
+    return file; // last resort: original (slow, but correct)
+  }
+}
+
+// Read a blob's pixel dimensions without keeping it decoded.
+function blobDimensions(blob) {
+  return new Promise(res => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { res({ w: img.naturalWidth, h: img.naturalHeight }); URL.revokeObjectURL(url); };
+    img.onerror = () => { res(null); URL.revokeObjectURL(url); };
+    img.src = url;
+  });
 }
 
 function freeUnit(u) {
@@ -576,20 +621,30 @@ async function renderSolo(unitIdx) {
   }
 
   const entry = loadUnit(u);
-  if (entry.img && entry.url) {
-    // already decoded — instant swap
+  if (entry.url) {
+    // preview already ready — instant swap
     placeholder.style.display = "none";
-    mainImg.src = entry.url;
+    await swapImage(mainImg, entry.url);
+    if (token !== renderToken) return;
     mainImg.style.display = "block";
   } else {
-    // not ready yet (far jump): keep current frame until decode finishes,
-    // then swap — but only if the user hasn't navigated away meanwhile.
+    // not ready yet (far jump): keep current frame until the preview is
+    // built, then swap — but only if the user hasn't navigated away.
     await entry.ready;
-    if (token !== renderToken) return; // superseded by a newer navigation
+    if (token !== renderToken || !entry.url) return; // superseded or failed
     placeholder.style.display = "none";
-    mainImg.src = entry.url;
+    await swapImage(mainImg, entry.url);
+    if (token !== renderToken) return;
     mainImg.style.display = "block";
   }
+}
+
+// Set an image source and wait for it to be decoded before returning, so
+// the visible swap happens in one frame with no flash of blank/old content.
+async function swapImage(imgEl, url) {
+  if (imgEl.src === url) return;
+  imgEl.src = url;
+  try { await imgEl.decode(); } catch {}
 }
 
 // ---------- Decisions ----------
@@ -675,7 +730,21 @@ async function onStripIntersect(entries) {
     slot.dataset.loaded = "1";
     try {
       const file = await u.jpg.getFile();
-      const url = URL.createObjectURL(file);
+      // Use the embedded EXIF thumbnail for the strip too — tiny and instant,
+      // never the 17 MB original.
+      let url;
+      const thumb = await exifr.thumbnail(file).catch(() => null);
+      if (thumb && thumb.byteLength) {
+        url = URL.createObjectURL(new Blob([thumb], { type: "image/jpeg" }));
+      } else {
+        // fallback: a small downscaled bitmap
+        const bmp = await createImageBitmap(file, { resizeWidth: 200, resizeQuality: "low" });
+        const c = document.createElement("canvas");
+        c.width = bmp.width; c.height = bmp.height;
+        c.getContext("2d").drawImage(bmp, 0, 0);
+        bmp.close && bmp.close();
+        url = await new Promise(r => c.toBlob(b => r(URL.createObjectURL(b)), "image/jpeg", 0.7));
+      }
       stripThumbUrls.set(idx, url);
       slot.style.backgroundImage = `url("${url}")`;
       slot.style.backgroundSize = "cover";
