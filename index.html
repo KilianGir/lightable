@@ -355,7 +355,7 @@ let sourceHandle = null;
 let units = [];      // each: {base, jpg:{handle,name}, raw:{handle,name}, time, status, url, isRawOnly}
 let groups = [];     // each: {type:'solo'|'group', items:[unitIndex...]}
 let cursor = 0;      // index into groups
-let objectUrls = [];
+const stripThumbUrls = new Map(); // unitIdx -> objectURL for filmstrip thumbnails
 
 // ---------- Open folder ----------
 async function openFolder() {
@@ -373,8 +373,10 @@ document.getElementById("btnOpen").onclick = openFolder;
 document.getElementById("btnOpen2").onclick = openFolder;
 
 async function scanFolder() {
-  // revoke any previous urls
-  objectUrls.forEach(u => URL.revokeObjectURL(u)); objectUrls = [];
+  // revoke any previously created object URLs (full-size window + strip thumbs)
+  for (const u of units) { if (u.url) { URL.revokeObjectURL(u.url); u.url = null; } }
+  for (const url of stripThumbUrls.values()) URL.revokeObjectURL(url);
+  stripThumbUrls.clear();
   const files = [];
   await walk(sourceHandle, files);
 
@@ -477,19 +479,49 @@ els.slider.oninput = () => {
   }
 };
 
-// ---------- Image loading ----------
+// ---------- Image loading (windowed) ----------
+const WINDOW = 10; // groups loaded on each side of the cursor
+
 async function ensureUrl(u) {
   if (u.url) return u.url;
   if (!u.jpg) return null; // raw only -> no preview
   const file = await u.jpg.getFile();
   u.url = URL.createObjectURL(file);
-  objectUrls.push(u.url);
   return u.url;
+}
+
+function freeUrl(u) {
+  if (u.url) { URL.revokeObjectURL(u.url); u.url = null; }
+}
+
+// Keep only images for groups within WINDOW of the cursor in memory.
+// Returns the set of unit indices that should currently be loaded.
+function windowUnitSet() {
+  const set = new Set();
+  const from = Math.max(0, cursor - WINDOW);
+  const to = Math.min(groups.length - 1, cursor + WINDOW);
+  for (let gi = from; gi <= to; gi++) {
+    for (const idx of groups[gi].items) set.add(idx);
+  }
+  return set;
+}
+
+// Free everything outside the window, then preload everything inside it.
+async function syncWindow() {
+  const keep = windowUnitSet();
+  for (let i = 0; i < units.length; i++) {
+    if (!keep.has(i)) freeUrl(units[i]);
+  }
+  // Preload current group first so it appears instantly, then neighbours.
+  const current = groups[cursor] ? groups[cursor].items : [];
+  for (const idx of current) await ensureUrl(units[idx]);
+  for (const idx of keep) { if (!current.includes(idx)) ensureUrl(units[idx]); }
 }
 
 // ---------- Render ----------
 function render() {
   if (!groups.length) return;
+  syncWindow();
   const g = groups[cursor];
   if (g.type === "solo") renderSolo(g.items[0]);
   else renderGroup(g);
@@ -610,9 +642,16 @@ function updateProgress() {
   els.counts.innerHTML = `<b>${decided}</b>/${units.length} triées · <span class="k">${keep} gardées</span> · <span class="r">${reject} rejetées</span>`;
 }
 
-// ---------- Filmstrip ----------
-async function renderFilmstrip() {
+// ---------- Filmstrip (lazy via IntersectionObserver) ----------
+let stripObserver = null;
+
+function renderFilmstrip() {
   els.filmstrip.innerHTML = "";
+  if (stripObserver) stripObserver.disconnect();
+  stripObserver = new IntersectionObserver(onStripIntersect, {
+    root: els.filmstrip, rootMargin: "200px 0px",
+  });
+
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
     for (let n = 0; n < g.items.length; n++) {
@@ -621,15 +660,40 @@ async function renderFilmstrip() {
       const item = document.createElement("div");
       item.className = "strip-item";
       item.dataset.group = gi; item.dataset.unit = idx;
-      const url = await ensureUrl(u);
-      const thumb = url ? `<img class="tn" src="${url}">` : `<div class="tn">RAW</div>`;
       const gflag = g.type === "group" && n === 0 ? `<span class="gflag">⊕${g.items.length}</span>` : "";
-      item.innerHTML = `${thumb}<span class="nm">${u.name}</span>${gflag}<span class="st ${u.status||''}"></span>`;
+      // thumbnail placeholder — real image loaded only when scrolled into view
+      const tn = u.jpg
+        ? `<div class="tn" data-thumb="${idx}"></div>`
+        : `<div class="tn">RAW</div>`;
+      item.innerHTML = `${tn}<span class="nm">${u.name}</span>${gflag}<span class="st ${u.status||''}"></span>`;
       item.onclick = () => { cursor = gi; render(); };
       els.filmstrip.appendChild(item);
+      if (u.jpg) stripObserver.observe(item);
     }
   }
   highlightStrip();
+}
+
+async function onStripIntersect(entries) {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    const el = entry.target;
+    const idx = parseInt(el.dataset.unit);
+    stripObserver.unobserve(el);
+    const u = units[idx];
+    if (!u.jpg) continue;
+    const slot = el.querySelector(".tn[data-thumb]");
+    if (!slot || slot.dataset.loaded) continue;
+    slot.dataset.loaded = "1";
+    try {
+      const file = await u.jpg.getFile();
+      const url = URL.createObjectURL(file);
+      stripThumbUrls.set(idx, url);
+      slot.style.backgroundImage = `url("${url}")`;
+      slot.style.backgroundSize = "cover";
+      slot.style.backgroundPosition = "center";
+    } catch {}
+  }
 }
 
 function highlightStrip() {
